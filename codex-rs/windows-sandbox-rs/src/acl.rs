@@ -49,6 +49,7 @@ use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 const SE_KERNEL_OBJECT: u32 = 6;
 const INHERIT_ONLY_ACE: u8 = 0x08;
+const INHERITED_ACE: u8 = 0x10;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 const GENERIC_READ_MASK: u32 = 0x8000_0000;
@@ -104,6 +105,26 @@ pub unsafe fn dacl_mask_allows(
     desired_mask: u32,
     require_all_bits: bool,
 ) -> bool {
+    dacl_mask_allows_filtered(
+        p_dacl,
+        psids,
+        desired_mask,
+        require_all_bits,
+        /*explicit_only*/ false,
+    )
+}
+
+/// Like [`dacl_mask_allows`], but with `explicit_only` set, ACEs inherited from
+/// an ancestor directory are ignored. Use this when deciding whether rewriting
+/// this object's DACL can change the answer: `SetEntriesInAclW` with
+/// `SET_ACCESS` only replaces explicit ACEs, so inherited ones are unaffected.
+pub unsafe fn dacl_mask_allows_filtered(
+    p_dacl: *mut ACL,
+    psids: &[*mut c_void],
+    desired_mask: u32,
+    require_all_bits: bool,
+    explicit_only: bool,
+) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -133,6 +154,9 @@ pub unsafe fn dacl_mask_allows(
             continue; // not ACCESS_ALLOWED
         }
         if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        if explicit_only && (hdr.AceFlags & INHERITED_ACE) != 0 {
             continue;
         }
         let base = p_ace as usize;
@@ -167,9 +191,27 @@ pub fn path_mask_allows(
     desired_mask: u32,
     require_all_bits: bool,
 ) -> Result<bool> {
+    path_mask_allows_filtered(
+        path,
+        psids,
+        desired_mask,
+        require_all_bits,
+        /*explicit_only*/ false,
+    )
+}
+
+/// Path-based wrapper around [`dacl_mask_allows_filtered`] (single DACL fetch).
+pub fn path_mask_allows_filtered(
+    path: &Path,
+    psids: &[*mut c_void],
+    desired_mask: u32,
+    require_all_bits: bool,
+    explicit_only: bool,
+) -> Result<bool> {
     unsafe {
         let (p_dacl, sd) = fetch_dacl_handle(path)?;
-        let has = dacl_mask_allows(p_dacl, psids, desired_mask, require_all_bits);
+        let has =
+            dacl_mask_allows_filtered(p_dacl, psids, desired_mask, require_all_bits, explicit_only);
         if !sd.is_null() {
             LocalFree(sd as HLOCAL);
         }
@@ -317,12 +359,19 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     for sid in sids {
+        // Only explicit ACEs count toward the disallow check: SET_ACCESS can
+        // replace explicit ACEs for the trustee but never removes ACEs
+        // inherited from an ancestor. Treating an inherited stale grant (for
+        // example a legacy FILE_DELETE_CHILD ACE on a parent directory) as
+        // "needs fixing" would rewrite this DACL on every command, repropagate
+        // inheritance across the whole tree, and still never converge.
         if dacl_mask_allows(p_dacl, &[*sid], allow_mask, /*require_all_bits*/ true)
-            && !dacl_mask_allows(
+            && !dacl_mask_allows_filtered(
                 p_dacl,
                 &[*sid],
                 disallow_mask,
                 /*require_all_bits*/ false,
+                /*explicit_only*/ true,
             )
         {
             continue;

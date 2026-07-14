@@ -22,6 +22,7 @@ use codex_windows_sandbox::is_command_cwd_root;
 use codex_windows_sandbox::log_note;
 use codex_windows_sandbox::log_writer;
 use codex_windows_sandbox::path_mask_allows;
+use codex_windows_sandbox::path_mask_allows_filtered;
 use codex_windows_sandbox::sandbox_bin_dir;
 use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
@@ -169,11 +170,16 @@ fn write_root_needs_refresh(root: &Path, psid: *mut c_void) -> Result<bool> {
     )? {
         return Ok(true);
     }
-    path_mask_allows(
+    // A refresh replaces explicit ACEs only; a stale FILE_DELETE_CHILD grant
+    // inherited from an ancestor directory cannot be removed here, so treating
+    // it as stale would trigger a full-workspace ACL rewrite on every command
+    // without ever converging.
+    path_mask_allows_filtered(
         root,
         &[psid],
         FILE_DELETE_CHILD,
         /*require_all_bits*/ false,
+        /*explicit_only*/ true,
     )
 }
 
@@ -1142,6 +1148,38 @@ mod tests {
             (seeded, needs_refresh_before, replaced, needs_refresh_after),
             (true, true, true, false)
         );
+    }
+
+    #[test]
+    fn write_root_refresh_ignores_inherited_stale_delete_child_grant() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let parent = temp.path().join("parent");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&parent).expect("create parent");
+
+        let workspace = parent.join("workspace");
+        let sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &workspace)
+            .expect("workspace sid");
+        let psid = unsafe { convert_string_sid_to_sid(&sid).expect("convert workspace sid") };
+        // A legacy Codex version left an inheritable stale grant on an
+        // ancestor directory. The workspace created below inherits it.
+        let stale_write_mask = WRITE_ROOT_ALLOW_MASK | FILE_DELETE_CHILD;
+        let seeded = unsafe { ensure_allow_mask_aces(&parent, &[psid], stale_write_mask) }
+            .expect("seed stale write ACE on parent");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        // The inherited grant cannot be replaced from the workspace, so it
+        // must neither report the root as stale nor trigger a rewrite.
+        let needs_refresh =
+            write_root_needs_refresh(&workspace, psid).expect("check inherited write ACE");
+        let rewrote = unsafe { ensure_allow_write_aces(&workspace, &[psid]) }
+            .expect("ensure write ACEs with inherited stale grant");
+        unsafe {
+            LocalFree(psid as HLOCAL);
+        }
+
+        assert_eq!((seeded, needs_refresh, rewrote), (true, false, false));
     }
 
     #[test]
